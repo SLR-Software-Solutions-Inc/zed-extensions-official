@@ -1,0 +1,177 @@
+name: Publish pytest-local to Zed Marketplace
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Checkout zed-pytest-local ────────────────────────────────────────
+      - name: Checkout zed-pytest-local
+        uses: actions/checkout@v4
+        with:
+          repository: SLR-Software-Solutions-Inc/zed-pytest-local
+          token: ${{ secrets.GH_PAT }}
+          path: zed-pytest-local
+
+      # ── 2. Read current version and bump patch ───────────────────────────────
+      - name: Bump patch version
+        id: ver
+        run: |
+          CURRENT=$(grep '^version' zed-pytest-local/extension.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+          NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW"         >> "$GITHUB_OUTPUT"
+          echo "Bumping $CURRENT → $NEW"
+
+      # ── 3. Update version in zed-pytest-local ───────────────────────────────
+      - name: Update extension.toml and Cargo.toml
+        run: |
+          CUR="${{ steps.ver.outputs.current }}"
+          NEW="${{ steps.ver.outputs.new }}"
+
+          sed -i "s/^version = \"${CUR}\"/version = \"${NEW}\"/" zed-pytest-local/extension.toml
+          sed -i "s/^version = \"${CUR}\"/version = \"${NEW}\"/" zed-pytest-local/Cargo.toml
+
+          # Update Cargo.lock [[package]] entry for this crate
+          sed -i "/^name = \"zed-pytest-local\"/{n; s/version = \"${CUR}\"/version = \"${NEW}\"/}" zed-pytest-local/Cargo.lock
+
+      # ── 4. Commit, tag, push zed-pytest-local ───────────────────────────────
+      - name: Commit and tag zed-pytest-local
+        run: |
+          cd zed-pytest-local
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add extension.toml Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${{ steps.ver.outputs.new }}"
+          git tag "v${{ steps.ver.outputs.new }}"
+          git push origin main
+          git push origin "v${{ steps.ver.outputs.new }}"
+
+      # ── 5. Checkout fork (no submodules — there are hundreds) ───────────────
+      - name: Checkout zed-extensions-official fork
+        uses: actions/checkout@v4
+        with:
+          repository: SLR-Software-Solutions-Inc/zed-extensions-official
+          token: ${{ secrets.GH_PAT }}
+          path: fork
+          submodules: false
+
+      # ── 6. Create publish branch ─────────────────────────────────────────────
+      - name: Create publish branch
+        run: |
+          cd fork
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "publish/zed-pytest-local-v${{ steps.ver.outputs.new }}"
+
+      # ── 7. Add or update submodule ───────────────────────────────────────────
+      - name: Add or update submodule
+        run: |
+          cd fork
+          TAG="v${{ steps.ver.outputs.new }}"
+
+          if grep -q 'zed-pytest-local' .gitmodules 2>/dev/null; then
+            # Already registered — fetch new tag and update pointer
+            git submodule update --init extensions/zed-pytest-local
+            cd extensions/zed-pytest-local
+            git fetch origin --tags
+            git checkout "$TAG"
+            cd ../..
+          else
+            # First time — add as submodule pinned to the tag
+            git submodule add \
+              https://github.com/SLR-Software-Solutions-Inc/zed-pytest-local \
+              extensions/zed-pytest-local
+            cd extensions/zed-pytest-local
+            git fetch origin --tags
+            git checkout "$TAG"
+            cd ../..
+          fi
+
+          git add extensions/zed-pytest-local .gitmodules
+
+      # ── 8. Update extensions.toml ────────────────────────────────────────────
+      - name: Update extensions.toml
+        run: |
+          cd fork
+          NEW="${{ steps.ver.outputs.new }}"
+
+          if grep -q '^\[zed-pytest-local\]' extensions.toml; then
+            # Update existing entry's version line
+            awk '
+              /^\[zed-pytest-local\]/ { in_block=1 }
+              in_block && /^version = / { sub(/"[^"]*"/, "\"'"$NEW"'\""); in_block=0 }
+              { print }
+            ' extensions.toml > extensions.toml.tmp && mv extensions.toml.tmp extensions.toml
+          else
+            # Append new entry (sort-extensions will order it)
+            printf '\n[zed-pytest-local]\nsubmodule = "extensions/zed-pytest-local"\nversion = "%s"\n' "$NEW" >> extensions.toml
+          fi
+
+      # ── 9. Sort extensions (required by zed-industries CI) ──────────────────
+      - name: Install pnpm and sort
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: fork/pnpm-lock.yaml
+
+      - name: Sort extensions.toml and .gitmodules
+        run: |
+          cd fork
+          pnpm install --frozen-lockfile
+          pnpm sort-extensions
+
+      # ── 10. Commit and push publish branch ──────────────────────────────────
+      - name: Commit and push fork branch
+        run: |
+          cd fork
+          git add extensions.toml .gitmodules extensions/zed-pytest-local
+          git commit -m "feat: add pytest-local v${{ steps.ver.outputs.new }}"
+          git push origin "publish/zed-pytest-local-v${{ steps.ver.outputs.new }}"
+
+      # ── 11. Open PR fork → zed-industries/extensions ────────────────────────
+      - name: Open PR to zed-industries/extensions
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const version = "${{ steps.ver.outputs.new }}";
+            const branch  = `publish/zed-pytest-local-v${version}`;
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner: "zed-industries",
+              repo:  "extensions",
+              title: `Add pytest-local v${version}`,
+              head:  `SLR-Software-Solutions-Inc:${branch}`,
+              base:  "main",
+              body: [
+                `## pytest-local v${version}`,
+                "",
+                "Adds the [pytest-local](https://github.com/SLR-Software-Solutions-Inc/zed-pytest-local) extension.",
+                "",
+                "**What it does:** Auto-activates on Python file open, installs a pytest plugin to `.venv/site-packages` via `pytest11` entry-point, and creates a gitignored `pytest_local.ini` for per-developer pytest overrides.",
+                "",
+                `- Extension repo: https://github.com/SLR-Software-Solutions-Inc/zed-pytest-local`,
+                `- Tag: v${version}`,
+                `- License: MIT`,
+              ].join("\n"),
+            });
+
+            console.log(`PR opened: ${pr.html_url}`);
+            core.summary.addRaw(`### PR opened\n${pr.html_url}`);
+            await core.summary.write();
