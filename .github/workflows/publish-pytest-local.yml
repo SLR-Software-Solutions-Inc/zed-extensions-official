@@ -56,27 +56,28 @@ jobs:
           git push origin main
           git push origin "v${{ steps.ver.outputs.new }}"
 
-      # ── 5. Checkout fork (no submodules — there are hundreds) ───────────────
-      - name: Checkout zed-extensions-official fork
+      # ── 5. Checkout UPSTREAM zed-industries/extensions (clean base) ──────────
+      # We base the PR branch on upstream main so the PR only contains our
+      # extension changes — none of our fork-specific commits or workflow files.
+      - name: Checkout upstream zed-industries/extensions
         uses: actions/checkout@v4
         with:
-          repository: SLR-Software-Solutions-Inc/zed-extensions-official
-          token: ${{ secrets.GH_ZED_EXTENSION_TOKEN }}
-          path: fork
+          repository: zed-industries/extensions
+          path: upstream
           submodules: false
 
-      # ── 6. Create publish branch ─────────────────────────────────────────────
-      - name: Create publish branch
+      - name: Configure fork as push remote
         run: |
-          cd fork
+          cd upstream
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add fork "https://x-access-token:${{ secrets.GH_ZED_EXTENSION_TOKEN }}@github.com/SLR-Software-Solutions-Inc/zed-extensions-official.git"
           git checkout -b "publish/zed-pytest-local-v${{ steps.ver.outputs.new }}"
 
-      # ── 7. Add or update submodule ───────────────────────────────────────────
+      # ── 6. Add or update submodule ───────────────────────────────────────────
       - name: Add or update submodule
         run: |
-          cd fork
+          cd upstream
           TAG="v${{ steps.ver.outputs.new }}"
 
           if grep -q 'zed-pytest-local' .gitmodules 2>/dev/null; then
@@ -99,10 +100,10 @@ jobs:
 
           git add extensions/zed-pytest-local .gitmodules
 
-      # ── 8. Update extensions.toml ────────────────────────────────────────────
+      # ── 7. Update extensions.toml ────────────────────────────────────────────
       - name: Update extensions.toml
         run: |
-          cd fork
+          cd upstream
           NEW="${{ steps.ver.outputs.new }}"
 
           if grep -q '^\[zed-pytest-local\]' extensions.toml; then
@@ -117,8 +118,8 @@ jobs:
             printf '\n[zed-pytest-local]\nsubmodule = "extensions/zed-pytest-local"\nversion = "%s"\n' "$NEW" >> extensions.toml
           fi
 
-      # ── 9. Sort extensions (required by zed-industries CI) ──────────────────
-      - name: Install pnpm and sort
+      # ── 8. Sort extensions (required by zed-industries CI) ──────────────────
+      - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -128,23 +129,23 @@ jobs:
         with:
           node-version: "20"
           cache: "pnpm"
-          cache-dependency-path: fork/pnpm-lock.yaml
+          cache-dependency-path: upstream/pnpm-lock.yaml
 
       - name: Sort extensions.toml and .gitmodules
         run: |
-          cd fork
+          cd upstream
           pnpm install --frozen-lockfile
           pnpm sort-extensions
 
-      # ── 10. Commit and push publish branch ──────────────────────────────────
-      - name: Commit and push fork branch
+      # ── 9. Commit and push branch to fork ────────────────────────────────────
+      - name: Commit and push to fork
         run: |
-          cd fork
+          cd upstream
           git add extensions.toml .gitmodules extensions/zed-pytest-local
           git commit -m "feat: add pytest-local v${{ steps.ver.outputs.new }}"
-          git push origin "publish/zed-pytest-local-v${{ steps.ver.outputs.new }}"
+          git push fork "publish/zed-pytest-local-v${{ steps.ver.outputs.new }}"
 
-      # ── 11. Open PR fork → zed-industries/extensions ────────────────────────
+      # ── 10. Open PR fork branch → zed-industries/extensions:main ─────────────
       - name: Open PR to zed-industries/extensions
         uses: actions/github-script@v7
         with:
